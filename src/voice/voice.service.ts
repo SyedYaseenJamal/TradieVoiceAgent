@@ -5,14 +5,23 @@ import { Model } from 'mongoose';
 import WebSocket from 'ws';
 import { Customer, CustomerDocument } from './Schema/customer.schema';
 
+/**
+ * RealtimeSession interface tracks the state of a single voice call.
+ * This includes the connection to OpenAI (Brain) and ElevenLabs (Voice).
+ */
 interface RealtimeSession {
-  ws: WebSocket;
-  onEvent: (event: any) => void;
+  ws: WebSocket;                // Connection to OpenAI Realtime API
+  elevenLabsWs: WebSocket | null; // Connection to ElevenLabs TTS API
+  elevenLabsReady: boolean;      // Becomes true when ElevenLabs is ready to talk
+  textBuffer: string[];         // Holds text while ElevenLabs is still connecting
+  onEvent: (event: any) => void; // Function to send data back to the browser
 }
 
 @Injectable()
 export class VoiceService {
   private readonly logger = new Logger(VoiceService.name);
+  
+  // This map keeps track of all active calls using the sessionId (Socket ID)
   private sessions = new Map<string, RealtimeSession>();
 
   constructor(
@@ -22,7 +31,8 @@ export class VoiceService {
   ) {}
 
   /**
-   * Opens a WebSocket to the OpenAI Realtime API and configures the session.
+   * STEP 1: Create the Brain (OpenAI Session)
+   * This opens a bi-directional pipe to OpenAI's GPT-4o-mini-realtime.
    */
   async createRealtimeSession(
     sessionId: string,
@@ -33,6 +43,7 @@ export class VoiceService {
     const url = `wss://api.openai.com/v1/realtime?model=${model}`;
 
     return new Promise((resolve, reject) => {
+      // Create the WebSocket to OpenAI
       const ws = new WebSocket(url, {
         headers: {
           Authorization: `Bearer ${apiKey}`,
@@ -41,49 +52,42 @@ export class VoiceService {
       });
 
       ws.on('open', () => {
-        this.logger.log(`[${sessionId}] Realtime WebSocket connected`);
+        this.logger.log(`[${sessionId}] OpenAI Realtime WebSocket connected`);
 
-        // Configure session
+        // CONFIGURE THE BRAIN:
+        // We tell OpenAI to listen to audio, but don't output audio (we use ElevenLabs for that)
         const sessionUpdate = {
           type: 'session.update',
           session: {
-            modalities: ['text', 'audio'],
-            instructions: this.getSystemPrompt(),
-            voice: 'alloy',
+            modalities: ['text', 'audio'], // Listen to user audio, respond with text
+            instructions: this.getSystemPrompt(), // THE "TRADIE" SCRIPT & RULES
+            voice: 'alloy', // Fallback voice (not used because we use ElevenLabs)
+            input_audio_format: 'pcm16',
             output_audio_format: 'pcm16',
             turn_detection: {
-              type: 'server_vad',
-              threshold: 0.5,
+              type: 'server_vad', // Automated Voice Activity Detection
+              threshold: 0.8,     // 0.8 sensitivity prevents interruptions from noise
               prefix_padding_ms: 300,
-              silence_duration_ms: 2000,
+              silence_duration_ms: 2000, // Wait 2 seconds of silence before AI speaks
             },
-            tools: [this.getSaveBookingTool()],
+            tools: [this.getSaveBookingTool()], // Register the MongoDB tool
             tool_choice: 'auto',
           },
         };
 
         ws.send(JSON.stringify(sessionUpdate));
 
-        // Wait for session.updated event before resolving, to ensure the prompt is active
-        const timeout = setTimeout(() => {
-          this.logger.warn(`[${sessionId}] session.updated timed out`);
-          resolve();
-        }, 5000);
+        // Initializing the session state in our Map
+        this.sessions.set(sessionId, { ws, elevenLabsWs: null, elevenLabsReady: false, textBuffer: [], onEvent });
 
-        ws.on('message', function handler(data: WebSocket.Data) {
-          try {
-            const event = JSON.parse(data.toString());
-            if (event.type === 'session.updated') {
-              clearTimeout(timeout);
-              ws.removeListener('message', handler);
-              resolve();
-            }
-          } catch (e) {}
-        });
-
-        this.sessions.set(sessionId, { ws, onEvent });
+        // IMPORTANT: Pre-open ElevenLabs so it's ready before the AI starts its first word
+        this.openElevenLabsStream(sessionId);
+        
+        // Finalize setup
+        resolve();
       });
 
+      // Handle raw messages from OpenAI
       ws.on('message', async (data: WebSocket.Data) => {
         try {
           const event = JSON.parse(data.toString());
@@ -93,16 +97,16 @@ export class VoiceService {
         }
       });
 
+      // Error and close handlers
       ws.on('error', (err) => {
-        this.logger.error(`[${sessionId}] WebSocket error:`, err);
+        this.logger.error(`[${sessionId}] OpenAI WebSocket error:`, err);
         onEvent({ type: 'error', error: { message: err.message } });
         reject(err);
       });
 
       ws.on('close', (code, reason) => {
-        this.logger.log(
-          `[${sessionId}] WebSocket closed: ${code} - ${reason}`,
-        );
+        this.logger.log(`[${sessionId}] OpenAI WebSocket closed: ${code} - ${reason}`);
+        this.closeElevenLabsWs(sessionId); // Kill the voice too if brain closes
         this.sessions.delete(sessionId);
         onEvent({ type: 'session-closed' });
       });
@@ -110,158 +114,186 @@ export class VoiceService {
   }
 
   /**
-   * Send a PCM16 audio chunk to the Realtime API.
+   * STEP 2: Relay User Audio to OpenAI
+   * The browser sends raw mic audio; we push it straight to OpenAI.
    */
   sendAudio(sessionId: string, base64Audio: string): void {
     const session = this.sessions.get(sessionId);
-    if (!session) {
-      this.logger.warn(`[${sessionId}] No active session for audio`);
-      return;
-    }
+    if (!session) return;
 
-    session.ws.send(
-      JSON.stringify({
-        type: 'input_audio_buffer.append',
-        audio: base64Audio,
-      }),
-    );
+    session.ws.send(JSON.stringify({
+      type: 'input_audio_buffer.append',
+      audio: base64Audio,
+    }));
   }
 
   /**
-   * Trigger an initial greeting from the model.
+   * STEP 3: The Greeting Logic
+   * We wait 3 seconds to ensure all WebSockets are stable, then tell AI to "Start Speaking."
    */
   triggerGreeting(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    // Just trigger a response. The system instructions tell it how to START.
-    session.ws.send(JSON.stringify({ type: 'response.create' }));
+    setTimeout(() => {
+      const s = this.sessions.get(sessionId);
+      if (!s) return;
+      s.ws.send(JSON.stringify({ type: 'response.create' }));
+    }, 3000);
   }
 
   /**
-   * Close the Realtime session.
+   * STEP 4: The Voice (ElevenLabs Integration)
+   * This opens a stream to ElevenLabs to convert OpenAI text into premium audio.
    */
-  closeSession(sessionId: string): void {
-    const session = this.sessions.get(sessionId);
-    if (session) {
-      session.ws.close();
-      this.sessions.delete(sessionId);
-      this.logger.log(`[${sessionId}] Session closed`);
-    }
-  }
-
-  /**
-   * Handle incoming events from the Realtime API.
-   */
-  private async handleRealtimeEvent(
-    sessionId: string,
-    event: any,
-  ): Promise<void> {
+  private openElevenLabsStream(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
+    this.closeElevenLabsWs(sessionId); // Clean up any old stream
+
+    const apiKey = this.config.get<string>('ELEVENLABS_API_KEY');
+    const voiceId = this.config.get<string>('ELEVENLABS_VOICE_ID');
+    const wsUrl = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=eleven_flash_v2_5&output_format=pcm_16000`;
+
+    const elWs = new WebSocket(wsUrl);
+
+    elWs.on('open', () => {
+      this.logger.log(`[${sessionId}] ElevenLabs WebSocket connected`);
+      
+      // Configuration message for ElevenLabs
+      elWs.send(JSON.stringify({
+        text: ' ',
+        voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+        xi_api_key: apiKey,
+      }));
+
+      // Flush any text that was sent to us while we were connecting
+      session.elevenLabsReady = true;
+      for (const text of session.textBuffer) {
+        this.sendTextToElevenLabs(sessionId, text);
+      }
+      session.textBuffer = [];
+    });
+
+    elWs.on('message', (data: WebSocket.Data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.audio) {
+          // ELEVENLABS AUDIO CHUNK -> Forward to Browser for playback!
+          session.onEvent({ type: 'audio-delta', delta: msg.audio });
+        }
+      } catch (err) {}
+    });
+
+    elWs.on('close', () => { session.elevenLabsReady = false; });
+    session.elevenLabsWs = elWs;
+  }
+
+  /**
+   * Sends a text chunk to the ElevenLabs mouth to generate voice.
+   */
+  private sendTextToElevenLabs(sessionId: string, text: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session?.elevenLabsWs?.readyState === WebSocket.OPEN) {
+      session.elevenLabsWs.send(JSON.stringify({ text, try_trigger_generation: true }));
+    }
+  }
+
+  /**
+   * Signals ElevenLabs that the sentence is finished.
+   */
+  private flushElevenLabsStream(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session?.elevenLabsWs?.readyState === WebSocket.OPEN) {
+      session.elevenLabsWs.send(JSON.stringify({ text: '' }));
+    }
+  }
+
+  /**
+   * Kills the voice stream (used during barge-in/interruptions).
+   */
+  private closeElevenLabsWs(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session?.elevenLabsWs) {
+      session.elevenLabsWs.close();
+      session.elevenLabsWs = null;
+      session.elevenLabsReady = false;
+      session.textBuffer = [];
+    }
+  }
+
+  /**
+   * STEP 5: THE EVENT HUB (Handling Brain Activities)
+   * This switch case reacts to everything OpenAI does.
+   */
+  private async handleRealtimeEvent(sessionId: string, event: any): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    // Diagnostic logs (remove in production if too noisy)
+    this.logger.debug(`[${sessionId}] OpenAI Debug Event: ${event.type}`);
+
     switch (event.type) {
-      case 'session.created':
-        this.logger.log(`[${sessionId}] session.created: ${event.session?.id}`);
-        break;
-
-      case 'session.updated':
-        this.logger.log(`[${sessionId}] session.updated successfully`);
-        break;
-
-      case 'response.audio.delta':
-        this.logger.verbose(`[${sessionId}] response.audio.delta received`);
-        session.onEvent({
-          type: 'audio-delta',
-          delta: event.delta,
-        });
+      case 'response.created':
+        // The AI is starting a new thought/response -> open the voice pipe!
+        this.openElevenLabsStream(sessionId);
         break;
 
       case 'response.audio_transcript.delta':
-        // Forward transcript text to browser
-        session.onEvent({
-          type: 'transcript-delta',
-          delta: event.delta,
-        });
+        // OpenAI thought of a word -> send it to ElevenLabs for speaking!
+        if (session.elevenLabsReady) {
+          this.sendTextToElevenLabs(sessionId, event.delta);
+        } else {
+          session.textBuffer.push(event.delta); // Wait for connection
+        }
+        // Also show the word on the screen in browser
+        session.onEvent({ type: 'transcript-delta', delta: event.delta });
         break;
 
       case 'response.audio_transcript.done':
-        session.onEvent({
-          type: 'transcript-done',
-          transcript: event.transcript,
-        });
+        // OpenAI finished the sentence -> Finish speaking
+        this.flushElevenLabsStream(sessionId);
+        session.onEvent({ type: 'transcript-done', transcript: event.transcript });
         break;
 
       case 'input_audio_buffer.speech_started':
-        // The user started speaking — tell browser to stop playback (barge-in)
+        // THE USER INTERRUPTED! Stop the AI from speaking immediately.
+        this.logger.log(`[${sessionId}] USER INTERRUPTED -> Stopping AI Voice`);
+        this.closeElevenLabsWs(sessionId);
         session.onEvent({ type: 'speech-started' });
         break;
 
-      case 'input_audio_buffer.speech_stopped':
-        this.logger.log(`[${sessionId}] User stopped speaking`);
-        break;
-
       case 'conversation.item.input_audio_transcription.completed':
-        this.logger.log(`[${sessionId}] User transcribed: "${event.transcript}"`);
-        session.onEvent({
-          type: 'user-transcript',
-          transcript: event.transcript,
-        });
+        // What the user said (text) -> Send to browser UI
+        session.onEvent({ type: 'user-transcript', transcript: event.transcript });
         break;
 
       case 'response.function_call_arguments.done':
+        // ALL 7 QUESTIONS ANSWERED -> Call the Database tool
         await this.handleFunctionCall(sessionId, event);
         break;
 
-      case 'response.done':
-        if (event.response?.status === 'failed') {
-          this.logger.error(
-            `[${sessionId}] Response failed:`,
-            JSON.stringify(event.response.status_details),
-          );
-        }
-        break;
-
       case 'error':
-        this.logger.error(
-          `[${sessionId}] Realtime API error:`,
-          JSON.stringify(event.error),
-        );
-        session.onEvent({
-          type: 'error',
-          error: event.error,
-        });
-        break;
-
-      default:
-        // Ignore other events (rate_limits.updated, response.created, etc.)
+        this.logger.error(`[${sessionId}] OpenAI Error: ${JSON.stringify(event.error)}`);
         break;
     }
   }
 
   /**
-   * Handle function calls from the Realtime model.
+   * STEP 6: DATA PERSISTENCE (Saving to MongoDB)
+   * A call to this happens automatically when the AI collects all 7 pieces of data.
    */
-  private async handleFunctionCall(
-    sessionId: string,
-    event: any,
-  ): Promise<void> {
+  private async handleFunctionCall(sessionId: string, event: any): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
     if (event.name === 'save_customer_booking') {
-      this.logger.log(
-        `[${sessionId}] Function call: save_customer_booking`,
-      );
-
       try {
-        this.logger.log(`[${sessionId}] Raw tool arguments: ${event.arguments}`);
         const args = JSON.parse(event.arguments);
-        this.logger.log(
-          `[${sessionId}] Saving booking to MongoDB: ${JSON.stringify(args)}`,
-        );
+        this.logger.log(`[${sessionId}] Saving Booking to MongoDB for: ${args.name}`);
 
-        // Save to MongoDB
+        // Write to your database!
         const customer = await this.customerModel.create({
           name: args.name,
           phone: args.phone,
@@ -270,60 +302,36 @@ export class VoiceService {
           serviceType: args.service_type,
           problemDescription: args.problem_description,
           preferredTime: args.preferred_time,
-          summary: `Booking for ${args.name}: ${args.service_type} - ${args.problem_description} (${args.urgency})`,
+          summary: `Tradie Booking: ${args.service_type}`,
         });
 
-        this.logger.log(
-          `[${sessionId}] Customer saved: ${customer._id}`,
-        );
+        this.logger.log(`[${sessionId}] SUCCESS: Customer saved with ID ${customer._id}`);
 
-        // Send function result back to model
-        session.ws.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'function_call_output',
-              call_id: event.call_id,
-              output: JSON.stringify({
-                success: true,
-                message: `Booking successfully saved in database for ${args.name}.`,
-              }),
-            },
-          }),
-        );
+        // Tell OpenAI the database save worked!
+        session.ws.send(JSON.stringify({
+          type: 'conversation.item.create',
+          item: {
+            type: 'function_call_output',
+            call_id: event.call_id,
+            output: JSON.stringify({ success: true, message: 'Saved to Database.' }),
+          },
+        }));
 
-        // Trigger the final confirmation message
+        // Ask OpenAI to say the "Final Goodbye" message
         session.ws.send(JSON.stringify({ type: 'response.create' }));
 
-        // Notify browser that booking was saved
-        session.onEvent({
-          type: 'booking-saved',
-          data: args,
-        });
+        // Notify UI
+        session.onEvent({ type: 'booking-saved', data: args });
+
       } catch (err) {
-        this.logger.error(`[${sessionId}] Failed to save booking:`, err);
-
-        session.ws.send(
-          JSON.stringify({
-            type: 'conversation.item.create',
-            item: {
-              type: 'function_call_output',
-              call_id: event.call_id,
-              output: JSON.stringify({
-                success: false,
-                message: 'Failed to save booking. Please try again.',
-              }),
-            },
-          }),
-        );
-
-        session.ws.send(JSON.stringify({ type: 'response.create' }));
+        this.logger.error(`[${sessionId}] MongoDB Save Failed:`, err);
       }
     }
   }
 
   /**
-   * System prompt for the Realtime voice agent.
+   * THE AI SCRIPT (System Prompt)
+   * This is where you define the personality and the 7 questions.
    */
   private getSystemPrompt(): string {
     return `### IDENTITY ###
@@ -345,6 +353,13 @@ You MUST ask these questions exactly in this order. NEVER skip a step.
 - Example: "I can definitely help with that once we finish this booking. So, what is your address?"
 - NEVER ask extra questions. NEVER give commentary outside the sequence.
 
+### HANDLING INTERRUPTIONS (FALSE BARGE-IN RECOVERY) ###
+- Sometimes background noise (a door closing, a cough, traffic) may sound like the user is speaking, causing you to stop mid-sentence.
+- If you are interrupted but the user does NOT say anything meaningful (silence or just noise), you MUST re-engage by saying something like:
+  "Sorry, I didn't quite catch that. So, [repeat the last question you were asking]."
+- NEVER stay silent. If there is an awkward pause after an interruption, always take the initiative and continue the conversation.
+- This is CRITICAL for maintaining a professional experience.
+
 ### FINAL ACTION ###
 - Once all 7 items are collected, you MUST call the save_customer_booking tool FIRST.
 - After the tool returns success, say this exactly: "Thank you so much! I have all your details now. I am saving this for the tradie, and they will call you back shortly. Have a great day!"
@@ -358,59 +373,40 @@ You MUST ask these questions exactly in this order. NEVER skip a step.
   }
 
   /**
-   * Tool definition for the save_customer_booking function.
+   * TOOL DEFINITION
+   * This is how OpenAI knows what fields to fill for the database save.
    */
   private getSaveBookingTool() {
     return {
       type: 'function',
       name: 'save_customer_booking',
-      description:
-        'Save the customer booking details to the database once all required information has been collected.',
+      description: 'Saves customer booking details to MongoDB.',
       parameters: {
         type: 'object',
         properties: {
-          name: {
-            type: 'string',
-            description: "The customer's full name",
-          },
-          phone: {
-            type: 'string',
-            description: "The customer's phone number",
-          },
-          address: {
-            type: 'string',
-            description: 'The address where the service is needed',
-          },
-          urgency: {
-            type: 'string',
-            description:
-              'How urgent the job is (e.g., emergency, urgent, can wait a few days)',
-          },
-          service_type: {
-            type: 'string',
-            description:
-              'The type of service needed (e.g., plumbing, electrical, carpentry)',
-          },
-          problem_description: {
-            type: 'string',
-            description: 'A brief description of the problem',
-          },
-          preferred_time: {
-            type: 'string',
-            description:
-              'The preferred day and time for the tradie to visit',
-          },
+          name: { type: 'string' },
+          phone: { type: 'string' },
+          address: { type: 'string' },
+          urgency: { type: 'string' },
+          service_type: { type: 'string' },
+          problem_description: { type: 'string' },
+          preferred_time: { type: 'string' },
         },
-        required: [
-          'name',
-          'phone',
-          'address',
-          'urgency',
-          'service_type',
-          'problem_description',
-          'preferred_time',
-        ],
+        required: ['name', 'phone', 'address', 'urgency', 'service_type', 'problem_description', 'preferred_time'],
       },
     };
+  }
+
+  /**
+   * Final cleanup of a session.
+   */
+  closeSession(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      this.closeElevenLabsWs(sessionId);
+      session.ws.close();
+      this.sessions.delete(sessionId);
+      this.logger.log(`[${sessionId}] Active Call Disconnected`);
+    }
   }
 }
