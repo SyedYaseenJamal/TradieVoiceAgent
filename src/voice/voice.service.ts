@@ -165,10 +165,10 @@ export class VoiceService {
       elWs.send(JSON.stringify({
         text: ' ',
         voice_settings: { 
-        stability: 0.4, 
-        similarity_boost: 0.75,
-        speed: 1.15
-       },
+          stability: 0.4, 
+          similarity_boost: 0.75,
+          speed: 1.15
+        },
         xi_api_key: apiKey,
       }));
 
@@ -188,6 +188,11 @@ export class VoiceService {
           session.onEvent({ type: 'audio-delta', delta: msg.audio });
         }
       } catch (err) {}
+    });
+
+    // FIX: Handle errors so terminate() during CONNECTING state doesn't crash Node
+    elWs.on('error', (err) => {
+      this.logger.warn(`[${sessionId}] ElevenLabs WS error: ${err.message}`);
     });
 
     elWs.on('close', () => { session.elevenLabsReady = false; });
@@ -220,7 +225,17 @@ export class VoiceService {
   private closeElevenLabsWs(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (session?.elevenLabsWs) {
-      session.elevenLabsWs.close();
+      try {
+        if (session.elevenLabsWs.readyState === WebSocket.CONNECTING) {
+          // Still handshaking — force-kill it safely instead of calling .close()
+          session.elevenLabsWs.terminate();
+        } else if (session.elevenLabsWs.readyState === WebSocket.OPEN) {
+          session.elevenLabsWs.close();
+        }
+        // If already CLOSING or CLOSED, do nothing — it's already shutting down
+      } catch (err) {
+        this.logger.warn(`[${sessionId}] Error closing ElevenLabs WS: ${err.message}`);
+      }
       session.elevenLabsWs = null;
       session.elevenLabsReady = false;
       session.textBuffer = [];
@@ -364,9 +379,11 @@ You MUST ask these questions exactly in this order. NEVER skip a step.
 - NEVER stay silent. If there is an awkward pause after an interruption, always take the initiative and continue the conversation.
 - This is CRITICAL for maintaining a professional experience.
 
-### FINAL ACTION ###
-- Once all 7 items are collected, you MUST call the save_customer_booking tool FIRST.
-- After the tool returns success, say this exactly: "Thank you so much! I have all your details now. I am saving this for the tradie, and they will call you back shortly. Have a great day!"
+### FINAL ACTION (MANDATORY - HIGHEST PRIORITY) ###
+- The MOMENT you have all 7 pieces of information (name, phone, address, urgency, service type, problem description, preferred time), you MUST IMMEDIATELY call the save_customer_booking tool.
+- Do NOT say anything before calling the tool. Do NOT ask for confirmation. Do NOT summarize. Just CALL THE TOOL.
+- Even if the conversation was messy or had interruptions, if you have all 7 data points, CALL THE TOOL NOW.
+- After the tool returns success, say EXACTLY: "Thank you so much! I have all your details now. I am saving this for the tradie, and they will call you back shortly. Have a great day!"
 - Do not say the final message until the tool has been called.
 
 ### RULES ###
